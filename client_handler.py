@@ -13,7 +13,6 @@ Responsibilities
 4. Hand off: Give each complete line to a pluggable "dispatcher" function.
              Module 2 will replace the stub dispatcher with the real
              SQL parser and execution router.
-
 Wire protocol (text, UTF 8, one message per line)
 -------------------------------------------------
     client -> server :  BEGIN | TRANSFER A B 50 | COMMIT | PING | QUIT
