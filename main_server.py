@@ -1,7 +1,6 @@
 """
 main_server.py
 Entry point of the Distributed Dual Engine Banking Server.
-
 Threading model: ACCEPTOR + FIXED WORKER POOL
 ---------------------------------------------
 * One acceptor thread (the main thread) does nothing but accept().
