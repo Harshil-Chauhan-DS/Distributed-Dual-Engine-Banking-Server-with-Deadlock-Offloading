@@ -15,6 +15,7 @@ Expected transaction shape (duck typing, so Module 2 objects can plug in):
     txn.priority int (optional)
     txn.ops      list of tuples, e.g. ("TRANSFER", "A", "B", 50), ("BALANCE", "A")
 """
+import itertools
 import threading
 import time
 from collections import defaultdict
@@ -63,6 +64,7 @@ class LockManager:
         self._waiting = {}                    # txn -> (resource, mode)
         self._victims = {}                    # txn -> cycle
         self._wfg = wfg
+        self._tls = threading.local()         # per thread: total seconds spent blocked
 
     def _blockers(self, txn, res, mode):
         """Holders that stop `txn` from getting `res` in `mode`."""
@@ -79,6 +81,7 @@ class LockManager:
             if held is LockMode.EXCLUSIVE or held is mode:
                 return                         # already strong enough
             # Falls through for an S -> X upgrade. Upgrades can deadlock too.
+            blocked_at = None                  # set the first time we have to wait
             self._waiting[txn] = (res, mode)
             try:
                 while True:
@@ -87,6 +90,8 @@ class LockManager:
                     blockers = self._blockers(txn, res, mode)
                     if not blockers:
                         break
+                    if blocked_at is None:
+                        blocked_at = time.monotonic()
                     self._wfg.set_waits(txn, blockers)   # publish wait edges
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
@@ -97,6 +102,15 @@ class LockManager:
             finally:
                 self._waiting.pop(txn, None)
                 self._wfg.clear_waiter(txn)
+                if blocked_at is not None:     # telemetry: add this wait to the thread total
+                    self._tls.waited = (getattr(self._tls, "waited", 0.0)
+                                        + time.monotonic() - blocked_at)
+
+    def take_wait(self):
+        """Seconds the CALLING thread spent blocked since the last call. Resets to 0."""
+        waited = getattr(self._tls, "waited", 0.0)
+        self._tls.waited = 0.0
+        return waited
 
     def release_all(self, txn):
         """The ONLY release path. Called at commit or after rollback."""
@@ -156,6 +170,7 @@ class EngineA:
         self.overflow = overflow_client or OverflowClient()
         self.lock_timeout = lock_timeout
         self.op_delay = op_delay               # pause between two lock requests (demos)
+        self._sys_ids = itertools.count(-1, -1)  # fake txn ids for applying overflow deltas
         self._stats = {"committed": 0, "aborted": 0, "offloaded": 0,
                        "offload_failed": 0}
         self._stats_lock = threading.Lock()
@@ -249,8 +264,35 @@ class EngineA:
             return {"status": "OFFLOAD_FAILED", "txn_id": txn.txn_id,
                     "reason": str(err), "cycle": cycle}
         self._bump("offloaded")
+        # The Overflow Server ran the txn on its own ledger. Copy the net
+        # changes into ours, otherwise the money would vanish from this engine.
+        if isinstance(reply, dict) and reply.get("status") == "COMMITTED":
+            self._apply_deltas(reply.get("deltas", {}))
         return {"status": "OFFLOADED", "txn_id": txn.txn_id, "cycle": cycle,
                 "overflow_reply": reply}
+
+    def _apply_deltas(self, deltas):
+        """
+        Add the overflow deltas to our balances under exclusive locks.
+        Locks are taken in sorted order. If this fake txn still loses a
+        deadlock to somebody, it lets go and tries again.
+        """
+        if not deltas:
+            return
+        tid = next(self._sys_ids)              # negative id, never clashes with real txns
+        accounts = sorted(deltas)
+        for _ in range(100):
+            try:
+                for acct in accounts:
+                    self.locks.acquire(tid, acct, LockMode.EXCLUSIVE, self.lock_timeout)
+                for acct in accounts:
+                    self.store.set(acct, self.store.get(acct) + deltas[acct])
+                return
+            except (DeadlockVictim, LockTimeout):
+                time.sleep(0.01)               # back off, then retry the whole thing
+            finally:
+                self.locks.release_all(tid)
+        raise LockTimeout("could not apply overflow deltas")
 
 
 # ------------------------------------------------------------------ self test
