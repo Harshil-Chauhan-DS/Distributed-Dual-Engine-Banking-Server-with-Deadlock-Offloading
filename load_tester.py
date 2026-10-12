@@ -155,7 +155,7 @@ def parse_args():
     p.add_argument("--clients", type=int, default=200)
     p.add_argument("--txns", type=int, default=5, help="txns per client")
     p.add_argument("--accounts", type=int, default=100)
-    p.add_argument("--hot-accounts", type=int, default=5)
+    p.add_argument("--hot-accounts", type=int, default=3)
     p.add_argument("--hot-pct", type=int, default=50,
                    help="percent of picks that land on hot accounts")
     p.add_argument("--max-amount", type=int, default=100)
