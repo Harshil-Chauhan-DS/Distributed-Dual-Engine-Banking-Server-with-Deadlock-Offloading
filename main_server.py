@@ -11,7 +11,7 @@ Threading model: ACCEPTOR + FIXED WORKER POOL
   If the queue is full the server says "ERR SERVER_BUSY" and hangs up.
   Shedding load early beats collapsing under it.
 
-Run:      python main_server.py --host 127.0.0.1 --port 9090 --pool 32
+Run:      python main_server.py --port 9090 --engine A
 Test:     nc 127.0.0.1 9090      then type PING
 Stop:     Ctrl+C  (graceful: workers finish, sockets close)
 """
@@ -32,8 +32,13 @@ from client_handler import (
     Dispatcher,
     default_dispatcher,
 )
-from execution_router import ExecutionRouter, RouterConfig
 from bank_dispatcher import TxnDispatcher
+from deadlock_detector import OverflowClient as OverflowClientA
+from engine_a_2pl import EngineA
+from engine_adapters import EngineAAdapter, EngineBAdapter, make_balances
+from engine_b_prevention import EngineB
+from engine_b_prevention import OverflowClient as OverflowClientB
+from execution_router import EngineMode, ExecutionRouter, RouterConfig
 
 log = logging.getLogger("bank.server")
 
@@ -51,8 +56,8 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 9090
     backlog: int = 1024          # kernel queue of fully opened connections
-    pool_size: int = 32          # worker threads = max live sessions
-    pending_limit: int = 64      # accepted sockets waiting for a free worker
+    pool_size: int = 300         # worker threads = max live sessions
+    pending_limit: int = 1000     # accepted sockets waiting for a free worker
     idle_timeout: float = 60.0   # seconds before an idle client is dropped
     accept_timeout: float = 0.5  # lets the accept loop notice a stop request
 
@@ -271,13 +276,64 @@ class BankingServer:
 # ----------------------------------------------------------------------------
 # Command line entry
 # ----------------------------------------------------------------------------
+def build_router(args):
+    """
+    Build both engines and the router that picks between them.
+    Both engines start with identical balances. The --engine flag decides
+    which one the router uses for every new transaction.
+    """
+    balances = make_balances(args.prefix, args.accounts, args.balance)
+
+    engine_a = EngineA(
+        dict(balances),
+        overflow_client=OverflowClientA(args.overflow_host, args.overflow_port, timeout=60.0),
+        op_delay=args.op_delay,
+    )
+    engine_b = EngineB(
+        dict(balances),
+        OverflowClientB(args.overflow_host, args.overflow_port, result_timeout=60.0),
+        think_time=args.op_delay,
+    )
+    mode = EngineMode.ENGINE_A if args.engine.upper() == "A" else EngineMode.ENGINE_B
+    router = ExecutionRouter(
+        RouterConfig(engine_mode=mode, worker_threads=args.workers,
+                     queue_limit=5000, default_timeout_s=60.0),
+        engines={EngineMode.ENGINE_A: EngineAAdapter(engine_a),
+                 EngineMode.ENGINE_B: EngineBAdapter(engine_b)},
+    )
+    return router, engine_a, engine_b, sum(balances.values())
+
+
+def print_summary(args, engine_a, engine_b, start_total) -> None:
+    """Printed on Ctrl+C. Total money must not change: transfers only move it."""
+    if args.engine.upper() == "A":
+        stats, now = engine_a.stats(), sum(engine_a.store.snapshot().values())
+    else:
+        stats, now = engine_b.stats(), sum(engine_b.accounts.values())
+    print("\n==== engine %s summary ====" % args.engine.upper())
+    for key, value in stats.items():
+        print("  %-18s %s" % (key, value))
+    print("  total money before %d, after %d  ->  %s"
+          % (start_total, now, "OK" if now == start_total else "MISMATCH"))
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Banking server, Module 1")
+    ap = argparse.ArgumentParser(description="Banking server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9090)
-    ap.add_argument("--pool", type=int, default=32, help="worker thread count")
-    ap.add_argument("--pending", type=int, default=64, help="wait queue size")
+    ap.add_argument("--pool", type=int, default=300, help="client threads (use more than your client count)")
+    ap.add_argument("--pending", type=int, default=1000, help="wait queue size")
     ap.add_argument("--idle", type=float, default=60.0, help="idle timeout seconds")
+    ap.add_argument("--engine", choices=["A", "B", "a", "b"], default="A",
+                    help="A = strict 2PL with detection, B = Wound Wait")
+    ap.add_argument("--workers", type=int, default=64, help="router threads running transactions")
+    ap.add_argument("--accounts", type=int, default=100, help="how many ACC accounts")
+    ap.add_argument("--prefix", default="ACC")
+    ap.add_argument("--balance", type=int, default=1_000_000, help="start balance per account")
+    ap.add_argument("--op-delay", type=float, default=0.02,
+                    help="seconds a txn pauses while holding a lock (makes deadlocks show up)")
+    ap.add_argument("--overflow-host", default="127.0.0.1")
+    ap.add_argument("--overflow-port", type=int, default=9100)
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -285,9 +341,9 @@ def main() -> None:
         format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s",
     )
 
-    # The router owns the scheduler thread and the engines.
+    # The router owns the scheduler threads and both engines.
     # It must start before any client can send a transaction.
-    router = ExecutionRouter(RouterConfig())
+    router, engine_a, engine_b, start_total = build_router(args)
     router.start()
 
     server = BankingServer(
@@ -309,6 +365,7 @@ def main() -> None:
         server.serve_forever()
     finally:
         router.stop()
+        print_summary(args, engine_a, engine_b, start_total)
 
 
 if __name__ == "__main__":
