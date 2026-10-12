@@ -99,6 +99,11 @@ class LoadClient(threading.Thread):
             sock.settimeout(a.timeout)
             rf = sock.makefile("r", encoding="utf-8", newline="\n")
             wf = sock.makefile("w", encoding="utf-8", newline="\n")
+            # The server speaks first: "OK READY session=N". Read it now.
+            # Skipping it shifts every later reply by one line.
+            greeting = rf.readline().strip()
+            if not greeting.upper().startswith("OK"):
+                raise ConnectionError("server refused: %s" % (greeting or "closed"))
         except OSError as exc:
             # Connection failed. Log every planned txn as an error and leave.
             # Still hit the barrier so the other clients do not hang.
