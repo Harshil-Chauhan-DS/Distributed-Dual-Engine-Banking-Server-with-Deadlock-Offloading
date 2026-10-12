@@ -151,7 +151,7 @@ class LoadClient(threading.Thread):
 def parse_args():
     p = argparse.ArgumentParser(description="Banking server load tester")
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=5000)
+    p.add_argument("--port", type=int, default=9090)
     p.add_argument("--clients", type=int, default=200)
     p.add_argument("--txns", type=int, default=5, help="txns per client")
     p.add_argument("--accounts", type=int, default=100)
