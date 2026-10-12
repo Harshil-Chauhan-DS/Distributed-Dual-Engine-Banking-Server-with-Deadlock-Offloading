@@ -94,6 +94,7 @@ def package_transaction(txn, origin, reason, cycle=None):
     The Overflow Server replays `ops` from the start.
     """
     return {
+        "type": "OFFLOAD",
         "txn_id": txn.txn_id,
         "priority": getattr(txn, "priority", 0),
         "ops": [list(op) for op in txn.ops],
@@ -126,11 +127,28 @@ class OverflowClient:
                 with socket.create_connection((self.host, self.port),
                                               timeout=self.timeout) as sock:
                     sock.sendall(frame)
-                    return self._read_frame(sock)
+                    return self._read_result(sock)
             except OSError as err:               # includes timeouts
                 last_err = err
                 time.sleep(0.1 * (attempt + 1))  # small backoff
         raise ConnectionError("overflow server unreachable: %s" % last_err)
+
+    def _read_result(self, sock):
+        """
+        The Overflow Server answers twice: ACK (queued) then RESULT (executed).
+        We wait for the RESULT so the caller knows what really happened.
+        BUSY is an OSError subclass here, so send() retries it with backoff.
+        """
+        while True:
+            reply = self._read_frame(sock)
+            kind = reply.get("type")
+            if kind == "RESULT":
+                return reply
+            if kind == "BUSY":
+                raise ConnectionError("overflow queue full")
+            if kind == "ERROR":
+                raise ValueError("overflow rejected package: %s" % reply.get("reason"))
+            # ACK or anything else: keep waiting for the RESULT frame
 
     def _read_frame(self, sock):
         (size,) = struct.unpack(">I", self._read_exact(sock, 4))
