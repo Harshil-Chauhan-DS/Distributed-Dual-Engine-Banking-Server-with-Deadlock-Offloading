@@ -32,6 +32,8 @@ from client_handler import (
     Dispatcher,
     default_dispatcher,
 )
+from execution_router import ExecutionRouter, RouterConfig
+from bank_dispatcher import TxnDispatcher
 
 log = logging.getLogger("bank.server")
 
@@ -48,7 +50,7 @@ class ServerConfig:
 
     host: str = "127.0.0.1"
     port: int = 9090
-    backlog: int = 128           # kernel queue of fully opened connections
+    backlog: int = 1024          # kernel queue of fully opened connections
     pool_size: int = 32          # worker threads = max live sessions
     pending_limit: int = 64      # accepted sockets waiting for a free worker
     idle_timeout: float = 60.0   # seconds before an idle client is dropped
@@ -283,6 +285,11 @@ def main() -> None:
         format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s",
     )
 
+    # The router owns the scheduler thread and the engines.
+    # It must start before any client can send a transaction.
+    router = ExecutionRouter(RouterConfig())
+    router.start()
+
     server = BankingServer(
         ServerConfig(
             host=args.host,
@@ -290,14 +297,18 @@ def main() -> None:
             pool_size=args.pool,
             pending_limit=args.pending,
             idle_timeout=args.idle,
-        )
+        ),
+        dispatcher=TxnDispatcher(router),   # was default_dispatcher (echo stub)
     )
 
     # Ctrl+C and kill both ask for a graceful stop.
     signal.signal(signal.SIGINT, lambda *_: server.stop())
     signal.signal(signal.SIGTERM, lambda *_: server.stop())
 
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        router.stop()
 
 
 if __name__ == "__main__":
