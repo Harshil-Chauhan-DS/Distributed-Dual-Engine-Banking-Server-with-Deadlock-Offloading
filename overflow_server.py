@@ -52,6 +52,58 @@ DEFAULT_PORT = 9100                  # Main server uses a different port on purp
 log = logging.getLogger("overflow")
 
 
+# --------------------------------------------------------------------------
+# Packet normalising. Engine A and Engine B each build packets in their own
+# shape. This turns both into the shape documented at the top of this file,
+# so the rest of the server only deals with one format.
+#   Engine A: {"txn_id": 7, "ops": [["TRANSFER","A","B",50]], "origin": "ENGINE_A"}
+#   Engine B: {"tx_id": 7,  "ops": [{"op":"TRANSFER","src":..,"dst":..,"amt":50}], ...}
+# The txn id gets the origin letter in front ("A-7", "B-7"), because both
+# engines count from 1 and the duplicate check must not mix them up.
+# --------------------------------------------------------------------------
+def _to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value                  # the ledger will reject it with a clear reason
+
+
+def _normalize_op(op) -> dict:
+    if isinstance(op, dict):
+        kind = str(op.get("op", "")).upper()
+        if kind == "TRANSFER":
+            amount = op.get("amount", op.get("amt"))
+            return {"op": "TRANSFER", "src": op.get("src"), "dst": op.get("dst"),
+                    "amount": _to_int(amount)}
+        if kind in ("BALANCE", "READ"):
+            return {"op": "READ", "account": op.get("account", op.get("acct"))}
+        return op
+    if isinstance(op, (list, tuple)) and op:
+        kind = str(op[0]).upper()
+        if kind == "TRANSFER" and len(op) == 4:
+            return {"op": "TRANSFER", "src": op[1], "dst": op[2], "amount": _to_int(op[3])}
+        if kind in ("BALANCE", "READ") and len(op) == 2:
+            return {"op": "READ", "account": op[1]}
+    return {"op": "UNKNOWN"}
+
+
+def normalize_packet(packet: dict) -> dict:
+    if packet.get("type") in ("STATS", "PING"):
+        return packet
+    raw_id = packet.get("txn_id", packet.get("tx_id"))
+    origin_text = str(packet.get("origin", "?")).upper()
+    origin = origin_text[-1] if origin_text[-1:] in ("A", "B") else origin_text
+    out = dict(packet)
+    out["type"] = packet.get("type") or "OFFLOAD"
+    out["origin"] = origin
+    if raw_id is not None:
+        out["txn_id"] = f"{origin}-{raw_id}"
+    raw_ops = packet.get("ops", packet.get("operations"))
+    if isinstance(raw_ops, list):
+        out["operations"] = [_normalize_op(o) for o in raw_ops]
+    return out
+
+
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     """Read exactly n bytes or raise. recv() may return fewer bytes than asked."""
     buf = bytearray()
@@ -244,7 +296,7 @@ class OverflowServer:
         log.info("IPC peer connected: %s", peer.addr)
         try:
             while not self._stop.is_set():
-                packet = recv_frame(peer.sock)
+                packet = normalize_packet(recv_frame(peer.sock))
                 kind = packet.get("type")
                 if kind == "OFFLOAD":
                     self._handle_offload(packet, peer)
@@ -347,11 +399,14 @@ class OverflowServer:
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
-def _load_balances(path: Optional[str]) -> Dict[str, int]:
+def _load_balances(path: Optional[str], prefix: str, count: int, balance: int) -> Dict[str, int]:
     if path:
         with open(path, "r", encoding="utf8") as fh:
             return {str(k): int(v) for k, v in json.load(fh).items()}
-    return {name: 1000 for name in ("A", "B", "C", "D", "E")}   # demo accounts
+    # Same accounts the main server creates: ACC0..ACC<count-1> plus A to E for hand tests.
+    accounts = {f"{prefix}{i}": balance for i in range(count)}
+    accounts.update({name: balance for name in ("A", "B", "C", "D", "E")})
+    return accounts
 
 
 def main() -> None:
@@ -360,11 +415,15 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--accounts", help="JSON file: {\"A\": 1000, \"B\": 500}")
     parser.add_argument("--queue-size", type=int, default=1000)
+    parser.add_argument("--prefix", default="ACC", help="account name prefix")
+    parser.add_argument("--count", type=int, default=100, help="how many accounts")
+    parser.add_argument("--balance", type=int, default=1_000_000, help="start balance each")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(threadName)s %(message)s")
     server = OverflowServer(args.host, args.port,
-                            Ledger(_load_balances(args.accounts)), args.queue_size)
+                            Ledger(_load_balances(args.accounts, args.prefix, args.count,
+                                                  args.balance)), args.queue_size)
     signal.signal(signal.SIGINT, lambda *_: server.stop())
     server.start()
 
