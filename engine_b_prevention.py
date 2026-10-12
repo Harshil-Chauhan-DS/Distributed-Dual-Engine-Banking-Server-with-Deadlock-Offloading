@@ -88,13 +88,24 @@ class OverflowClient:
                 send_msg(sock, packet)
                 sock.settimeout(self.result_timeout)
                 try:
-                    return recv_msg(sock)
+                    return self._wait_result(sock)
                 except socket.timeout:
                     # Packet is queued over there. Result just is not ready.
                     return {"status": "OFFLOADED_PENDING",
                             "tx_id": packet["tx_id"]}
             finally:
                 sock.close()
+
+    @staticmethod
+    def _wait_result(sock):
+        """Server sends ACK first, then RESULT. Skip the ACK and wait for RESULT."""
+        while True:
+            reply = recv_msg(sock)
+            kind = reply.get("type")
+            if kind == "RESULT":
+                return reply
+            if kind in ("BUSY", "ERROR"):
+                raise OverflowUnavailable("overflow said %s" % kind)
 
     def _connect(self):
         last_err = None
@@ -167,6 +178,8 @@ class EngineB:
         kind = op.get("op", "").upper()
         if kind == "TRANSFER":
             self._transfer(ctx, op["src"], op["dst"], int(op["amt"]))
+        elif kind == "BALANCE":
+            self._balance(ctx, op["acct"])
         else:
             raise ValueError("unknown operation: %r" % kind)
 
@@ -190,6 +203,15 @@ class EngineB:
             ctx.undo.setdefault(dst, self.accounts[dst])
             self.accounts[src] -= amt
             self.accounts[dst] += amt
+
+    def _balance(self, ctx, acct):
+        """Read op. Engine B only has exclusive locks, so a read locks like a write."""
+        with self._cv:
+            if ctx.is_wounded():
+                raise WoundedError()
+            if acct not in self.accounts:
+                raise KeyError("no such account")
+            self._lock_account(ctx, acct)
 
     # ---- the Wound Wait core -------------------------------------------
 
@@ -278,16 +300,33 @@ class EngineB:
         packet = ctx.to_packet(reason="WOUNDED")
         try:
             reply = self.overflow.send(packet)
-        except OverflowUnavailable as err:
+        except (OverflowUnavailable, OSError) as err:
             self._bump("offload_failed")
             ctx.state = TxState.ABORTED
             return self._result(ctx, "OFFLOAD_FAILED", reason=str(err))
 
         ctx.state = TxState.OFFLOADED
         self._bump("offloaded")
+        # Copy the Overflow Server's net changes into our balances.
+        if isinstance(reply, dict) and reply.get("status") == "COMMITTED":
+            self._apply_deltas(reply.get("deltas", {}))
         result = self._result(ctx, "OFFLOADED")
         result["overflow_reply"] = reply
         return result
+
+    def _apply_deltas(self, deltas):
+        """
+        Add overflow deltas to our balances. One step under the engine mutex.
+        A running txn may hold one of these accounts. If it later rolls back
+        it restores its before image, which would erase our delta. So we add
+        the delta to that before image too. Both stay consistent.
+        """
+        with self._cv:
+            for acct, delta in deltas.items():
+                self.accounts[acct] += delta
+                holder = self._lock_table.get(acct)
+                if holder is not None and acct in holder.undo:
+                    holder.undo[acct] += delta
 
     # ---- small helpers -------------------------------------------------
 
