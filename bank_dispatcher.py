@@ -12,10 +12,17 @@ and one worker thread serves one client at a time, so no lock is needed.
 """
 
 
+import json
+
+
 class TxnDispatcher:
-    def __init__(self, router):
+    def __init__(self, router, snapshot=None, stats=None):
         # router is an ExecutionRouter from execution_router.py
         self.router = router
+        # snapshot() returns {account: balance}. Used only by the SHOW demo command.
+        self.snapshot = snapshot
+        # stats() returns a dict of engine counters. Used by the STATS command.
+        self.stats = stats
 
     def __call__(self, session, line):
         word = line.split()[0].upper()
@@ -24,11 +31,30 @@ class TxnDispatcher:
         if word == "PING":
             return "OK PONG"
 
+        # SHOW           -> total money in the system
+        # SHOW A B       -> balances of A and B
+        # Demo helper. It reads without locks, so use it when the system is quiet.
+        if word == "SHOW":
+            if self.snapshot is None:
+                return "ERR SHOW_UNAVAILABLE"
+            bal = self.snapshot()
+            names = [n.upper() for n in line.split()[1:]]
+            if not names:
+                return "OK TOTAL=%d" % sum(bal.values())
+            return "OK " + " ".join("%s=%s" % (n, bal.get(n, "?")) for n in names)
+
+        # STATS -> engine counters as one JSON line. The load tester reads it before and
+        # after a run and compares it with what the clients saw.
+        if word == "STATS":
+            if self.stats is None:
+                return "ERR STATS_UNAVAILABLE"
+            return "OK " + json.dumps(self.stats())
+
         # Start a new transaction buffer.
         if word == "BEGIN":
             if session.transaction is not None:
                 return "ERR NESTED_BEGIN"
-            session.transaction = ["BEGIN"]
+            session.transaction = [line]            # keep "BEGIN PRIORITY n" as typed
             return "OK BEGIN"
 
         # Any other command needs an open transaction.
@@ -36,10 +62,11 @@ class TxnDispatcher:
             return "ERR NO_TXN send BEGIN first"
 
         session.transaction.append(line)
-        if word != "COMMIT":
+        if word not in ("COMMIT", "ROLLBACK"):
             return "OK QUEUED"
 
-        # COMMIT arrived. Run the whole script now.
+        # COMMIT or ROLLBACK arrived. Run the whole script now.
+        # The router sees the final word. A ROLLBACK script never touches a balance.
         script = "\n".join(session.transaction)
         session.transaction = None          # slot is free for the next txn
         result = self.router.execute_script(
